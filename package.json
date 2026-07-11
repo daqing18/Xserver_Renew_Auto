@@ -1,0 +1,12 @@
+{
+  "name": "xserver-renew",
+  "version": "1.0.0",
+  "description": "XServer 自动延期脚本",
+  "main": "renew.js",
+  "scripts": {
+    "start": "node renew.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
