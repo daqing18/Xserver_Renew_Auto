@@ -41,17 +41,8 @@ function gitCommitPush(commitMsg) {
   }
 }
 
-function getTodayStr() {
-  return new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
-}
-
-function addDaysStr(dateStr, days) {
-  const d = new Date(dateStr);
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
-}
-
 function formatSeconds(sec) {
+  if (sec < 3600) return Math.floor(sec / 60) + '分钟' + (sec % 60) + '秒';
   return Math.floor(sec / 3600) + '小时' + Math.floor((sec % 3600) / 60) + '分钟';
 }
 
@@ -83,17 +74,20 @@ async function sendTG(statusIcon, statusText, extra, imagePath) {
   } catch (e) { console.log('⚠️ TG 发送失败:', e.message); }
 }
 
+// 修改为按小时/时间戳调度，适应12小时生命周期
 function checkScheduling() {
-  const today = getTodayStr();
+  const now = Date.now();
   const s = getAccountStatus();
-  if (!s.nextCheckDate) { console.log('🆕 首次运行'); return; }
-  if (process.env.GITHUB_EVENT_NAME !== 'schedule') { console.log('💻 本地模式'); return; }
-  if (today < s.nextCheckDate) {
-    var days = Math.ceil((new Date(s.nextCheckDate) - new Date(today)) / 86400000);
-    console.log('⏳ 预约 ' + s.nextCheckDate + '，还剩 ' + days + ' 天，秒退');
+  if (!s.nextCheckTime) { console.log('🆕 首次运行或无旧定时状态，开始检查'); return; }
+  if (process.env.GITHUB_EVENT_NAME !== 'schedule') { console.log('💻 本地/手动触发模式，忽略定时预约'); return; }
+  
+  if (now < s.nextCheckTime) {
+    var hoursLeft = ((s.nextCheckTime - now) / 3600000).toFixed(1);
+    var nextStr = new Date(s.nextCheckTime + 8 * 3600000).toISOString().replace('T', ' ').slice(0, 19);
+    console.log('⏳ 预约北京时间 ' + nextStr + '，还剩 ' + hoursLeft + ' 小时，秒退');
     process.exit(0);
   }
-  console.log('📅 到达预约日期 ' + today);
+  console.log('📅 到达或超过预约时间，开始执行检查');
 }
 
 async function parseRemainingMinutes(page) {
@@ -116,20 +110,23 @@ async function parseRemainingMinutes(page) {
   } catch (e) { console.log('⚠️ 解析失败:', e.message); return null; }
 }
 
-function calcNextCheckDays(afterH) {
-  // 距离进入续签窗口（<16h）还有多久，提前2h到达作为缓冲
-  var hoursUntilWindow = afterH - 16 - 2;
-  return Math.max(1, Math.floor(hoursUntilWindow / 24));
+// 计算下一次检查需要等待的小时数
+function calcNextCheckHours(afterH) {
+  // 距离进入续签窗口（<4h）还有多久，提前0.5小时到达作为缓冲
+  var hoursUntilWindow = afterH - 4 - 0.5;
+  return Math.max(1, Math.floor(hoursUntilWindow));
 }
 
-function updateNextCheckDate(daysLater, reason) {
-  var next = addDaysStr(getTodayStr(), daysLater);
+function updateNextCheckTime(hoursLater, reason) {
+  var nextTime = Date.now() + hoursLater * 3600000;
+  var nextStr = new Date(nextTime + 8 * 3600000).toISOString().replace('T', ' ').slice(0, 19);
   var status = loadStatus();
   if (!status[ACC]) status[ACC] = {};
-  status[ACC].nextCheckDate = next;
+  status[ACC].nextCheckTime = nextTime;
+  status[ACC].nextCheckStr = nextStr; // 写入易读的北京时间字符串
   saveStatus(status);
-  console.log('📅 下次预约: ' + next + '（' + reason + '）');
-  gitCommitPush('[Bot] ' + ACC + ' 下次检查 ' + next);
+  console.log('📅 下次检查: 北京时间 ' + nextStr + '（' + reason + '）');
+  gitCommitPush('[Bot] ' + ACC + ' 下次检查 ' + nextStr);
 }
 
 async function tryRenew(page, beforeMins) {
@@ -163,15 +160,15 @@ async function tryRenew(page, beforeMins) {
     saveStatus(status);
 
     if (afterMins !== null) {
-      // 根据续签后实际剩余时间动态计算下次检查时机
+      // 根据续签后实际剩余时间动态计算下次检查时机（按小时计算）
       var afterHNum = afterMins / 60;
-      var skipDays = calcNextCheckDays(afterHNum);
-      updateNextCheckDate(skipDays, '续签成功，续签后' + afterHNum.toFixed(1) + 'h，' + skipDays + '天后检查');
-      await sendTG('✅', '续签成功', timeInfo + '\n续签后' + afterHNum.toFixed(1) + 'h，下次检查' + skipDays + '天后', 'success.png');
+      var skipHours = calcNextCheckHours(afterHNum);
+      updateNextCheckTime(skipHours, '续签成功，续签后' + afterHNum.toFixed(1) + 'h，' + skipHours + '小时后检查');
+      await sendTG('✅', '续签成功', timeInfo + '\n续签后' + afterHNum.toFixed(1) + 'h，下次检查' + skipHours + '小时后', 'success.png');
     } else {
-      // 续签后剩余时间解析失败，保守处理1天后再查
-      updateNextCheckDate(1, '续签成功，剩余时间解析失败，保守1天后检查');
-      await sendTG('✅', '续签成功', timeInfo + '\n剩余时间解析失败，保守1天后检查', 'success.png');
+      // 续签后剩余时间解析失败，保守处理6小时后再查（12小时生命周期的一半）
+      updateNextCheckTime(6, '续签成功，剩余时间解析失败，保守6小时后检查');
+      await sendTG('✅', '续签成功', timeInfo + '\n剩余时间解析失败，保守6小时后检查', 'success.png');
     }
   } catch (e) {
     console.log('⚠️ 未找到延期按钮');
@@ -184,7 +181,7 @@ async function tryRenew(page, beforeMins) {
 
 (async function main() {
   console.log('==================================================');
-  console.log('XServer 自动延期 (叠加续签动态调度版)');
+  console.log('XServer 自动延期 (12小时周期 / 4小时窗口适配版)');
   console.log('==================================================');
   if (!ACC || !ACC_PWD) { console.log('❌ 未找到账号或密码'); process.exit(1); }
   checkScheduling();
@@ -229,23 +226,23 @@ async function tryRenew(page, beforeMins) {
     } else {
       var h = totalMins / 60;
 
-      if (h > 16) {
-        // 探测模式：距离进入续签窗口（<16h）还有多久，提前2h到达
-        var hoursUntilWindow = h - 16 - 2;
-        var skipDays = Math.max(1, Math.floor(hoursUntilWindow / 24));
-        console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，距续签窗口还有' + hoursUntilWindow.toFixed(1) + 'h，预约' + skipDays + '天后检查');
-        await sendTG('🔭', '探测跳过', '剩余' + h.toFixed(1) + 'h，距窗口' + hoursUntilWindow.toFixed(1) + 'h，' + skipDays + '天后检查', '3_game_manage.png');
-        updateNextCheckDate(skipDays, '探测模式，距窗口' + hoursUntilWindow.toFixed(1) + 'h');
-      } else if (h > 12) {
-        // 伏击模式：在续签窗口内（12h~16h），随机延迟0~2h后续签
-        var maxDelaySec = 2 * 3600;
+      if (h > 4) {
+        // 探测模式：距离进入续签窗口（<4h）还有多久，提前0.5h到达
+        var hoursUntilWindow = h - 4 - 0.5;
+        var skipHours = Math.max(1, Math.floor(hoursUntilWindow));
+        console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，距续签窗口还有' + hoursUntilWindow.toFixed(1) + 'h，预约' + skipHours + '小时后检查');
+        await sendTG('🔭', '探测跳过', '剩余' + h.toFixed(1) + 'h，距窗口' + hoursUntilWindow.toFixed(1) + 'h，' + skipHours + '小时后检查', '3_game_manage.png');
+        updateNextCheckTime(skipHours, '探测模式，距窗口' + hoursUntilWindow.toFixed(1) + 'h');
+      } else if (h > 3) {
+        // 伏击模式：在续签窗口内（3h~4h），随机延迟0~30分钟后续签（缩短伏击时间）
+        var maxDelaySec = 1800; // 30分钟
         var delay = Math.floor(Math.random() * maxDelaySec);
         console.log('🎯 伏击模式: 剩余' + h.toFixed(1) + 'h，随机延迟' + formatSeconds(delay) + '后续签');
         await sendTG('🎯', '伏击模式', '剩余' + h.toFixed(1) + 'h，' + formatSeconds(delay) + '后执行');
         await new Promise(function(r) { setTimeout(r, delay * 1000); });
         await tryRenew(page, totalMins);
       } else {
-        // 紧急模式：剩余 ≤ 12h，立即续签
+        // 紧急模式：剩余 ≤ 3h，立即续签（延长紧急模式范围）
         console.log('🚨 紧急模式: 剩余' + h.toFixed(1) + 'h，立即执行');
         await tryRenew(page, totalMins);
       }
