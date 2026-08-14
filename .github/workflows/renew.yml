@@ -143,11 +143,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId | jq -r '.[].databaseId' | \
-          while read -r run_id; do
-            count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "删除运行记录: $run_id"
-              gh run delete "$run_id" || true
+          RUNS=$(gh run list --workflow="${{ github.workflow }}" --limit=1000 --json databaseId --jq '.[].databaseId')
+          COUNT=0
+          for RUN_ID in $RUNS; do
+            COUNT=$((COUNT + 1))
+            if [ $COUNT -gt 1 ]; then
+              echo "删除运行记录: $RUN_ID"
+              gh run delete "$RUN_ID"
+              sleep 0.5
             fi
           done
+          echo "共处理 ${COUNT} 条记录，保留最新 1 条"
