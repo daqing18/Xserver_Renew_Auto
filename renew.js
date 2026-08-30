@@ -245,17 +245,19 @@ async function tryRenew(page, beforeMins) {
       var h = totalMins / 60;
 
       if (h > 4) {
-        // 探测模式：距离进入续签窗口（<4h）还有多久，提前0.5h到达
-        var hoursUntilWindow = h - 4 - 0.5;
-        if (hoursUntilWindow <= SELF_WAIT_MAX_H) {
+        // ===== 探测模式：剩余 >4h，还不能续期 =====
+        // 续期窗口：剩余时间 <4h 才允许续期（用户确认：≥4h 不能续，续一次 +12h）。
+        // 目标：睡到剩余约 TARGET_REMAIN_H=3h（确保醒来时一定在窗口内 <4h），然后立即续期。
+        var TARGET_REMAIN_H = 3;
+        var waitMs = Math.round((h - TARGET_REMAIN_H) * 3600000);
+        if (waitMs <= SELF_WAIT_MAX_H * 3600000) {
           // ===== 自等待模式（抗 GitHub 调度延迟）=====
           // 等待时间不长：直接在本次任务内睡到窗口时间，然后重新加载页面继续续期，
           // 不再依赖 GitHub Actions 下一次 cron 触发，彻底避免调度延迟导致的错过窗口。
-          var waitMs = Math.round(hoursUntilWindow * 3600000);
-          console.log('🕐 自等待模式: 剩余' + h.toFixed(1) + 'h，距窗口' + hoursUntilWindow.toFixed(1) + 'h，任务内等待' + formatSeconds(waitMs / 1000) + '后继续，不依赖下次触发');
+          console.log('🕐 自等待模式: 剩余' + h.toFixed(1) + 'h，任务内等待' + formatSeconds(waitMs / 1000) + '后（剩余约' + TARGET_REMAIN_H + 'h，进入<4h窗口）立即续期，不依赖下次触发');
           await sendTG('🕐', '自等待', '剩余' + h.toFixed(1) + 'h，任务内等待' + formatSeconds(waitMs / 1000) + '后续期（抗调度延迟，本次任务内完成）', '3_game_manage.png');
           await new Promise(function(r) { setTimeout(r, waitMs); });
-          // 等待结束，重新读取剩余时间并继续（可能已进入窗口或伏击/紧急范围）
+          // 等待结束，重新读取剩余时间并继续（此时应已在 <4h 窗口内）
           console.log('⏰ 等待结束，重新检查剩余时间...');
           await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 30000 });
           await page.waitForTimeout(2000);
@@ -272,27 +274,25 @@ async function tryRenew(page, beforeMins) {
           console.log('🚀 重新点击延期');
           await page.getByRole('link', { name: 'アップグレード・期限延長' }).click();
           await page.waitForLoadState('load');
-          if (h > 4) {
-            // 意外仍在4h以上（理论上不该发生），走预约兜底
+          if (h >= 4) {
+            // 意外仍在4h及以上（理论不该发生，可能是页面解析异常），预约兜底
             var skipHours = calcNextCheckHours(h);
-            console.log('🔭 仍剩余' + h.toFixed(1) + 'h（异常），预约' + skipHours + '小时后检查');
+            console.log('🔭 仍剩余' + h.toFixed(1) + 'h（异常≥4h），预约' + skipHours + '小时后检查');
             updateNextCheckTime(skipHours, '自等待后仍剩余' + h.toFixed(1) + 'h');
           } else if (h > 3) {
-            var maxDelaySec = AMBUSH_DELAY_SEC;
-            var delay = Math.floor(Math.random() * maxDelaySec);
-            console.log('🎯 伏击模式: 剩余' + h.toFixed(1) + 'h，随机延迟' + formatSeconds(delay) + '后续签');
-            await new Promise(function(r) { setTimeout(r, delay * 1000); });
+            // 已在窗口内(3h~4h)，但为确保一次到位，不做随机延迟直接续
+            console.log('🎯 窗口内: 剩余' + h.toFixed(1) + 'h，立即续期');
             await tryRenew(page, totalMins);
           } else {
-            console.log('🚨 紧急模式: 剩余' + h.toFixed(1) + 'h，立即执行');
+            console.log('🚨 窗口内: 剩余' + h.toFixed(1) + 'h，立即续期');
             await tryRenew(page, totalMins);
           }
         } else {
           // 等待时间过长，无法在单次 job 内等待，退回"预约-退出"模式
-          var skipHours = Math.max(1, Math.floor(hoursUntilWindow));
-          console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，距续期窗口还有' + hoursUntilWindow.toFixed(1) + 'h，超过自等待上限(' + SELF_WAIT_MAX_H + 'h)，预约' + skipHours + '小时后检查');
-          await sendTG('🔭', '探测跳过', '剩余' + h.toFixed(1) + 'h，距窗口' + hoursUntilWindow.toFixed(1) + 'h，' + skipHours + '小时后检查', '3_game_manage.png');
-          updateNextCheckTime(skipHours, '探测模式，距窗口' + hoursUntilWindow.toFixed(1) + 'h');
+          var skipHours = Math.max(1, Math.floor(h - 4));
+          console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，距续期窗口还有' + (h - 4).toFixed(1) + 'h，超过自等待上限(' + SELF_WAIT_MAX_H + 'h)，预约' + skipHours + '小时后检查');
+          await sendTG('🔭', '探测跳过', '剩余' + h.toFixed(1) + 'h，距窗口' + (h - 4).toFixed(1) + 'h，' + skipHours + '小时后检查', '3_game_manage.png');
+          updateNextCheckTime(skipHours, '探测模式，距窗口' + (h - 4).toFixed(1) + 'h');
         }
       } else if (h > 3) {
         // 伏击模式：在续签窗口内（3h~4h），随机延迟0~30分钟后续签（缩短伏击时间）
