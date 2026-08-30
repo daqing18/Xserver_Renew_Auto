@@ -12,6 +12,16 @@ const PROXY_URL = process.env.PROXY_URL;
 const LOGIN_URL = 'https://secure.xserver.ne.jp/xapanel/login/xmgame';
 const STATUS_FILE = 'status.json';
 
+// ===== 抗 GitHub Actions 调度延迟配置 =====
+// 自等待上限：距续期窗口(剩余<4h)的等待时间不超过这个值(小时)时，
+// 脚本不再"预约退出"等 cron 再次触发，而是直接在本次任务内睡到窗口时间再续期。
+// GitHub Actions 免费版单 job 最长运行约 6 小时，留点余量设为 4h。
+const SELF_WAIT_MAX_H = 4;   // 可调：自等待最长时间(小时)
+// 提前缓冲：cron 触发时刻若距预约时间还有不到 BUFFER_MIN 分钟，则不秒退，
+// 直接继续检查（避免"预约14:03、cron 14:00 差3分钟就白等2小时"的问题）。
+const EARLY_RUN_BUFFER_MIN = 45; // 可调：分钟
+const AMBUSH_DELAY_SEC = 1800; // 伏击模式随机延迟上限(秒)，默认30分钟
+
 function loadStatus() {
   try {
     if (fs.existsSync(STATUS_FILE)) return JSON.parse(fs.readFileSync(STATUS_FILE, 'utf8'));
@@ -80,10 +90,18 @@ function checkScheduling() {
   const s = getAccountStatus();
   if (!s.nextCheckTime) { console.log('🆕 首次运行或无旧定时状态，开始检查'); return; }
   if (process.env.GITHUB_EVENT_NAME !== 'schedule') { console.log('💻 本地/手动触发模式，忽略定时预约'); return; }
-  
-  if (now < s.nextCheckTime) {
-    var hoursLeft = ((s.nextCheckTime - now) / 3600000).toFixed(1);
+
+  var diffMs = now - s.nextCheckTime;
+  if (diffMs < 0) {
+    var hoursLeft = (-diffMs / 3600000).toFixed(1);
     var nextStr = new Date(s.nextCheckTime + 8 * 3600000).toISOString().replace('T', ' ').slice(0, 19);
+    // 提前缓冲：距离预约时间很近了（如 cron 14:00 触发、预约 14:03），
+    // 此时秒退会白等一整轮 cron 间隔，直接继续执行更稳妥。
+    var minutesLeft = -diffMs / 60000;
+    if (minutesLeft <= EARLY_RUN_BUFFER_MIN) {
+      console.log('📅 距预约 ' + nextStr + ' 仅剩 ' + minutesLeft.toFixed(0) + ' 分钟（< ' + EARLY_RUN_BUFFER_MIN + 'min），不秒退，直接执行检查');
+      return;
+    }
     console.log('⏳ 预约北京时间 ' + nextStr + '，还剩 ' + hoursLeft + ' 小时，秒退');
     process.exit(0);
   }
@@ -181,7 +199,7 @@ async function tryRenew(page, beforeMins) {
 
 (async function main() {
   console.log('==================================================');
-  console.log('XServer 自动延期 (12小时周期 / 4小时窗口适配版)');
+  console.log('XServer 自动延期 (自等待抗延迟版)');
   console.log('==================================================');
   if (!ACC || !ACC_PWD) { console.log('❌ 未找到账号或密码'); process.exit(1); }
   checkScheduling();
@@ -229,13 +247,56 @@ async function tryRenew(page, beforeMins) {
       if (h > 4) {
         // 探测模式：距离进入续签窗口（<4h）还有多久，提前0.5h到达
         var hoursUntilWindow = h - 4 - 0.5;
-        var skipHours = Math.max(1, Math.floor(hoursUntilWindow));
-        console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，距续签窗口还有' + hoursUntilWindow.toFixed(1) + 'h，预约' + skipHours + '小时后检查');
-        await sendTG('🔭', '探测跳过', '剩余' + h.toFixed(1) + 'h，距窗口' + hoursUntilWindow.toFixed(1) + 'h，' + skipHours + '小时后检查', '3_game_manage.png');
-        updateNextCheckTime(skipHours, '探测模式，距窗口' + hoursUntilWindow.toFixed(1) + 'h');
+        if (hoursUntilWindow <= SELF_WAIT_MAX_H) {
+          // ===== 自等待模式（抗 GitHub 调度延迟）=====
+          // 等待时间不长：直接在本次任务内睡到窗口时间，然后重新加载页面继续续期，
+          // 不再依赖 GitHub Actions 下一次 cron 触发，彻底避免调度延迟导致的错过窗口。
+          var waitMs = Math.round(hoursUntilWindow * 3600000);
+          console.log('🕐 自等待模式: 剩余' + h.toFixed(1) + 'h，距窗口' + hoursUntilWindow.toFixed(1) + 'h，任务内等待' + formatSeconds(waitMs / 1000) + '后继续，不依赖下次触发');
+          await sendTG('🕐', '自等待', '剩余' + h.toFixed(1) + 'h，任务内等待' + formatSeconds(waitMs / 1000) + '后续期（抗调度延迟，本次任务内完成）', '3_game_manage.png');
+          await new Promise(function(r) { setTimeout(r, waitMs); });
+          // 等待结束，重新读取剩余时间并继续（可能已进入窗口或伏击/紧急范围）
+          console.log('⏰ 等待结束，重新检查剩余时间...');
+          await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 30000 });
+          await page.waitForTimeout(2000);
+          await page.locator('#memberid').fill(ACC);
+          await page.locator('#user_password').fill(ACC_PWD);
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'load', timeout: 30000 }),
+            page.locator('input[name="action_user_login"]').click()
+          ]);
+          await page.getByRole('link', { name: 'ゲーム管理' }).click();
+          await page.waitForLoadState('load');
+          totalMins = await parseRemainingMinutes(page);
+          h = totalMins ? totalMins / 60 : 0;
+          console.log('🚀 重新点击延期');
+          await page.getByRole('link', { name: 'アップグレード・期限延長' }).click();
+          await page.waitForLoadState('load');
+          if (h > 4) {
+            // 意外仍在4h以上（理论上不该发生），走预约兜底
+            var skipHours = calcNextCheckHours(h);
+            console.log('🔭 仍剩余' + h.toFixed(1) + 'h（异常），预约' + skipHours + '小时后检查');
+            updateNextCheckTime(skipHours, '自等待后仍剩余' + h.toFixed(1) + 'h');
+          } else if (h > 3) {
+            var maxDelaySec = AMBUSH_DELAY_SEC;
+            var delay = Math.floor(Math.random() * maxDelaySec);
+            console.log('🎯 伏击模式: 剩余' + h.toFixed(1) + 'h，随机延迟' + formatSeconds(delay) + '后续签');
+            await new Promise(function(r) { setTimeout(r, delay * 1000); });
+            await tryRenew(page, totalMins);
+          } else {
+            console.log('🚨 紧急模式: 剩余' + h.toFixed(1) + 'h，立即执行');
+            await tryRenew(page, totalMins);
+          }
+        } else {
+          // 等待时间过长，无法在单次 job 内等待，退回"预约-退出"模式
+          var skipHours = Math.max(1, Math.floor(hoursUntilWindow));
+          console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，距续期窗口还有' + hoursUntilWindow.toFixed(1) + 'h，超过自等待上限(' + SELF_WAIT_MAX_H + 'h)，预约' + skipHours + '小时后检查');
+          await sendTG('🔭', '探测跳过', '剩余' + h.toFixed(1) + 'h，距窗口' + hoursUntilWindow.toFixed(1) + 'h，' + skipHours + '小时后检查', '3_game_manage.png');
+          updateNextCheckTime(skipHours, '探测模式，距窗口' + hoursUntilWindow.toFixed(1) + 'h');
+        }
       } else if (h > 3) {
         // 伏击模式：在续签窗口内（3h~4h），随机延迟0~30分钟后续签（缩短伏击时间）
-        var maxDelaySec = 1800; // 30分钟
+        var maxDelaySec = AMBUSH_DELAY_SEC; // 30分钟
         var delay = Math.floor(Math.random() * maxDelaySec);
         console.log('🎯 伏击模式: 剩余' + h.toFixed(1) + 'h，随机延迟' + formatSeconds(delay) + '后续签');
         await sendTG('🎯', '伏击模式', '剩余' + h.toFixed(1) + 'h，' + formatSeconds(delay) + '后执行');
