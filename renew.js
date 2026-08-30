@@ -12,18 +12,15 @@ const PROXY_URL = process.env.PROXY_URL;
 const LOGIN_URL = 'https://secure.xserver.ne.jp/xapanel/login/xmgame';
 const STATUS_FILE = 'status.json';
 
-// ===== 抗 GitHub Actions 调度延迟配置 =====
-// 自等待上限：距续期窗口(剩余<4h)的等待时间不超过这个值(小时)时，
-// 脚本不再"预约退出"等 cron 再次触发，而是直接在本次任务内睡到窗口时间再续期。
-// GitHub Actions 免费版单 job 最长运行约 6 小时（公共仓库 360 分钟上限）。
-// 自等待实际睡眠时长 = 剩余h - TARGET_REMAIN_H，需控制在 job 余量内。
-// 设 5h：睡眠 ≤5h + 登录/续期操作约 1h，接近但不超过 6h 上限。
-// 若仓库是私有的且 workflow 里 timeout-minutes 设得更大，可再调大（如 6）。
-const SELF_WAIT_MAX_H = 5;   // 可调：自等待最长时间(小时)
+// ===== 续期策略配置 =====
+// 策略：不在任务内长时间睡眠（避免公共仓库长占 runner 被误判为滥用/封号）。
+//   - 剩余 ≥4h（窗口外）：预约-退出，靠 workflow cron 每 30 分钟兜底触发拾起；
+//   - 剩余 <4h（窗口内）：立即续期，最多随机延迟 30 分钟（防多个账号同一分钟并发）；
+// 任何单次等待不超过 AMBUSH_DELAY_SEC（30 分钟），单 job 最长约 30 分钟+登录续期。
 // 提前缓冲：cron 触发时刻若距预约时间还有不到 BUFFER_MIN 分钟，则不秒退，
 // 直接继续检查（避免"预约14:03、cron 14:00 差3分钟就白等2小时"的问题）。
 const EARLY_RUN_BUFFER_MIN = 45; // 可调：分钟
-const AMBUSH_DELAY_SEC = 1800; // 伏击模式随机延迟上限(秒)，默认30分钟
+const AMBUSH_DELAY_SEC = 1800; // 窗口内随机延迟上限(秒)，最大30分钟
 
 function loadStatus() {
   try {
@@ -202,7 +199,7 @@ async function tryRenew(page, beforeMins) {
 
 (async function main() {
   console.log('==================================================');
-  console.log('XServer 自动延期 (自等待抗延迟版)');
+  console.log('XServer 自动延期 (窗口内立即续期版)');
   console.log('==================================================');
   if (!ACC || !ACC_PWD) { console.log('❌ 未找到账号或密码'); process.exit(1); }
   checkScheduling();
@@ -250,60 +247,19 @@ async function tryRenew(page, beforeMins) {
       if (h > 4) {
         // ===== 探测模式：剩余 >4h，还不能续期 =====
         // 续期窗口：剩余时间 <4h 才允许续期（用户确认：≥4h 不能续，续一次 +12h）。
-        // 目标：睡到剩余约 TARGET_REMAIN_H=3h（确保醒来时一定在窗口内 <4h），然后立即续期。
-        // 剩余 ≤8.5h（距窗口≤4.5h）都会走自等待，本次任务内完成续期，不依赖 cron。
-        var TARGET_REMAIN_H = 3;
-        var waitMs = Math.round((h - TARGET_REMAIN_H) * 3600000);
-        if (waitMs <= SELF_WAIT_MAX_H * 3600000) {
-          // ===== 自等待模式（抗 GitHub 调度延迟）=====
-          // 等待时间不长：直接在本次任务内睡到窗口时间，然后重新加载页面继续续期，
-          // 不再依赖 GitHub Actions 下一次 cron 触发，彻底避免调度延迟导致的错过窗口。
-          console.log('🕐 自等待模式: 剩余' + h.toFixed(1) + 'h，任务内等待' + formatSeconds(waitMs / 1000) + '后（剩余约' + TARGET_REMAIN_H + 'h，进入<4h窗口）立即续期，不依赖下次触发');
-          await sendTG('🕐', '自等待', '剩余' + h.toFixed(1) + 'h，任务内等待' + formatSeconds(waitMs / 1000) + '后续期（抗调度延迟，本次任务内完成）', '3_game_manage.png');
-          await new Promise(function(r) { setTimeout(r, waitMs); });
-          // 等待结束，重新读取剩余时间并继续（此时应已在 <4h 窗口内）
-          console.log('⏰ 等待结束，重新检查剩余时间...');
-          await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 30000 });
-          await page.waitForTimeout(2000);
-          await page.locator('#memberid').fill(ACC);
-          await page.locator('#user_password').fill(ACC_PWD);
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'load', timeout: 30000 }),
-            page.locator('input[name="action_user_login"]').click()
-          ]);
-          await page.getByRole('link', { name: 'ゲーム管理' }).click();
-          await page.waitForLoadState('load');
-          totalMins = await parseRemainingMinutes(page);
-          h = totalMins ? totalMins / 60 : 0;
-          console.log('🚀 重新点击延期');
-          await page.getByRole('link', { name: 'アップグレード・期限延長' }).click();
-          await page.waitForLoadState('load');
-          if (h >= 4) {
-            // 意外仍在4h及以上（理论不该发生，可能是页面解析异常），预约兜底
-            var skipHours = calcNextCheckHours(h);
-            console.log('🔭 仍剩余' + h.toFixed(1) + 'h（异常≥4h），预约' + skipHours + '小时后检查');
-            updateNextCheckTime(skipHours, '自等待后仍剩余' + h.toFixed(1) + 'h');
-          } else if (h > 3) {
-            // 已在窗口内(3h~4h)，但为确保一次到位，不做随机延迟直接续
-            console.log('🎯 窗口内: 剩余' + h.toFixed(1) + 'h，立即续期');
-            await tryRenew(page, totalMins);
-          } else {
-            console.log('🚨 窗口内: 剩余' + h.toFixed(1) + 'h，立即续期');
-            await tryRenew(page, totalMins);
-          }
-        } else {
-          // 等待时间过长，无法在单次 job 内等待，退回"预约-退出"模式
-          var skipHours = Math.max(1, Math.floor(h - 4));
-          console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，距续期窗口还有' + (h - 4).toFixed(1) + 'h，超过自等待上限(' + SELF_WAIT_MAX_H + 'h)，预约' + skipHours + '小时后检查');
-          await sendTG('🔭', '探测跳过', '剩余' + h.toFixed(1) + 'h，距窗口' + (h - 4).toFixed(1) + 'h，' + skipHours + '小时后检查', '3_game_manage.png');
-          updateNextCheckTime(skipHours, '探测模式，距窗口' + (h - 4).toFixed(1) + 'h');
-        }
+        // 策略：不在任务内长时间睡眠（避免公共仓库长占 runner 被误判滥用），
+        // 改为预约-退出，靠 workflow cron 每 30 分钟兜底触发；一旦进入 <4h 窗口，
+        // 下一次触发就会走到下方窗口内分支立即续期。单 job 最长约 30 分钟，无封号风险。
+        var skipHours = calcNextCheckHours(h); // 预约到窗口前约0.5h
+        console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，距续期窗口还有' + (h - 4).toFixed(1) + 'h，预约' + skipHours + '小时后检查（不长时间睡眠，cron每30分钟兜底）');
+        await sendTG('🔭', '探测跳过', '剩余' + h.toFixed(1) + 'h，距窗口' + (h - 4).toFixed(1) + 'h，' + skipHours + '小时后检查', '3_game_manage.png');
+        updateNextCheckTime(skipHours, '探测模式，距窗口' + (h - 4).toFixed(1) + 'h');
       } else if (h > 3) {
-        // 伏击模式：在续签窗口内（3h~4h），随机延迟0~30分钟后续签（缩短伏击时间）
+        // 窗口内(3h~4h)：已允许续期，随机延迟0~30分钟后续签（防多个账号同一分钟并发）
         var maxDelaySec = AMBUSH_DELAY_SEC; // 30分钟
         var delay = Math.floor(Math.random() * maxDelaySec);
-        console.log('🎯 伏击模式: 剩余' + h.toFixed(1) + 'h，随机延迟' + formatSeconds(delay) + '后续签');
-        await sendTG('🎯', '伏击模式', '剩余' + h.toFixed(1) + 'h，' + formatSeconds(delay) + '后执行');
+        console.log('🎯 窗口内立即续期: 剩余' + h.toFixed(1) + 'h，随机延迟' + formatSeconds(delay) + '后续签');
+        await sendTG('🎯', '窗口内续期', '剩余' + h.toFixed(1) + 'h，' + formatSeconds(delay) + '后执行');
         await new Promise(function(r) { setTimeout(r, delay * 1000); });
         await tryRenew(page, totalMins);
       } else {
