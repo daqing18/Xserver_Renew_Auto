@@ -53,7 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     # 自等待模式会让单 job 运行数小时，必须显式设置超时上限。
     # 公共仓库最大 360（6小时）；私有仓库可设更大（如 720）。
-    timeout-minutes: 360
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 1
