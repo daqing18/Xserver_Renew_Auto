@@ -14,13 +14,11 @@ const STATUS_FILE = 'status.json';
 
 // ===== 续期策略配置 =====
 // 策略：不在任务内长时间睡眠（避免公共仓库长占 runner 被误判为滥用/封号）。
-//   - 剩余 ≥4h（窗口外）：预约-退出，靠 workflow cron 每 30 分钟兜底触发拾起；
-//   - 剩余 <4h（窗口内）：立即续期，最多随机延迟 30 分钟（防多个账号同一分钟并发）；
-// 任何单次等待不超过 AMBUSH_DELAY_SEC（30 分钟），单 job 最长约 30 分钟+登录续期。
-// 提前缓冲：cron 触发时刻若距预约时间还有不到 BUFFER_MIN 分钟，则不秒退，
-// 直接继续检查（避免"预约14:03、cron 14:00 差3分钟就白等2小时"的问题）。
-const EARLY_RUN_BUFFER_MIN = 45; // 可调：分钟
-const AMBUSH_DELAY_SEC = 1800; // 窗口内随机延迟上限(秒)，最大30分钟
+//   - 窗口外按预约时间快速退出，不占用 runner；
+//   - 到达预约时间后真实检查，一旦剩余时间 ≤4 小时立即续期。
+const RENEW_WINDOW_HOURS = 4; // XServer 剩余时间低于 4 小时后可续期
+const WINDOW_LEAD_HOURS = 2; // 提前 2 小时开始检查，给 Actions 延迟留出余量
+const EARLY_RUN_BUFFER_MIN = 45; // 距预约不足 45 分钟时不秒退，直接检查
 
 function loadStatus() {
   try {
@@ -84,7 +82,6 @@ async function sendTG(statusIcon, statusText, extra, imagePath) {
   } catch (e) { console.log('⚠️ TG 发送失败:', e.message); }
 }
 
-// 修改为按小时/时间戳调度，适应12小时生命周期
 function checkScheduling() {
   const now = Date.now();
   const s = getAccountStatus();
@@ -93,16 +90,13 @@ function checkScheduling() {
 
   var diffMs = now - s.nextCheckTime;
   if (diffMs < 0) {
-    var hoursLeft = (-diffMs / 3600000).toFixed(1);
     var nextStr = new Date(s.nextCheckTime + 8 * 3600000).toISOString().replace('T', ' ').slice(0, 19);
-    // 提前缓冲：距离预约时间很近了（如 cron 14:00 触发、预约 14:03），
-    // 此时秒退会白等一整轮 cron 间隔，直接继续执行更稳妥。
     var minutesLeft = -diffMs / 60000;
     if (minutesLeft <= EARLY_RUN_BUFFER_MIN) {
-      console.log('📅 距预约 ' + nextStr + ' 仅剩 ' + minutesLeft.toFixed(0) + ' 分钟（< ' + EARLY_RUN_BUFFER_MIN + 'min），不秒退，直接执行检查');
+      console.log('📅 距预约 ' + nextStr + ' 仅剩 ' + minutesLeft.toFixed(0) + ' 分钟，直接执行检查');
       return;
     }
-    console.log('⏳ 预约北京时间 ' + nextStr + '，还剩 ' + hoursLeft + ' 小时，秒退');
+    console.log('⏳ 预约北京时间 ' + nextStr + '，还剩 ' + minutesLeft.toFixed(0) + ' 分钟，快速退出');
     process.exit(0);
   }
   console.log('📅 到达或超过预约时间，开始执行检查');
@@ -128,11 +122,9 @@ async function parseRemainingMinutes(page) {
   } catch (e) { console.log('⚠️ 解析失败:', e.message); return null; }
 }
 
-// 计算下一次检查需要等待的小时数
 function calcNextCheckHours(afterH) {
-  // 距离进入续签窗口（<4h）还有多久，提前0.5小时到达作为缓冲
-  var hoursUntilWindow = afterH - 4 - 0.5;
-  return Math.max(1, Math.floor(hoursUntilWindow));
+  // 预约到进入续期窗口前约 2 小时；窗口内每次真实检查发现低剩余时间都立即续签。
+  return Math.max(0.25, afterH - RENEW_WINDOW_HOURS - WINDOW_LEAD_HOURS);
 }
 
 function updateNextCheckTime(hoursLater, reason) {
@@ -189,11 +181,12 @@ async function tryRenew(page, beforeMins) {
       await sendTG('✅', '续签成功', timeInfo + '\n剩余时间解析失败，保守6小时后检查', 'success.png');
     }
   } catch (e) {
-    console.log('⚠️ 未找到延期按钮');
+    console.log('⚠️ 未找到延期按钮，本轮标记失败，等待下一次 cron 重试');
     await page.screenshot({ path: 'skip.png' });
     var s = getAccountStatus();
     if (!s.lastSuccess) await sendTG('🕐', '等待中', '按钮未出现', 'skip.png');
     else await sendTG('⚠️', '跳过', '未到时间', 'skip.png');
+    process.exitCode = 1;
   }
 }
 
@@ -244,27 +237,18 @@ async function tryRenew(page, beforeMins) {
     } else {
       var h = totalMins / 60;
 
-      if (h > 4) {
+      if (h > RENEW_WINDOW_HOURS) {
         // ===== 探测模式：剩余 >4h，还不能续期 =====
         // 续期窗口：剩余时间 <4h 才允许续期（用户确认：≥4h 不能续，续一次 +12h）。
-        // 策略：不在任务内长时间睡眠（避免公共仓库长占 runner 被误判滥用），
-        // 改为预约-退出，靠 workflow cron 每 30 分钟兜底触发；一旦进入 <4h 窗口，
-        // 下一次触发就会走到下方窗口内分支立即续期。单 job 最长约 30 分钟，无封号风险。
-        var skipHours = calcNextCheckHours(h); // 预约到窗口前约0.5h
-        console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，距续期窗口还有' + (h - 4).toFixed(1) + 'h，预约' + skipHours + '小时后检查（不长时间睡眠，cron每30分钟兜底）');
+        // 策略：记录下次检查时间，但下一次 cron 仍会真实检查；一旦进入 ≤4h 窗口立即续签。
+        var skipHours = calcNextCheckHours(h);
+        console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，提前预约' + skipHours.toFixed(2) + '小时后检查（cron每15分钟兜底）');
         await sendTG('🔭', '探测跳过', '剩余' + h.toFixed(1) + 'h，距窗口' + (h - 4).toFixed(1) + 'h，' + skipHours + '小时后检查', '3_game_manage.png');
         updateNextCheckTime(skipHours, '探测模式，距窗口' + (h - 4).toFixed(1) + 'h');
-      } else if (h > 3) {
-        // 窗口内(3h~4h)：已允许续期，随机延迟0~30分钟后续签（防多个账号同一分钟并发）
-        var maxDelaySec = AMBUSH_DELAY_SEC; // 30分钟
-        var delay = Math.floor(Math.random() * maxDelaySec);
-        console.log('🎯 窗口内立即续期: 剩余' + h.toFixed(1) + 'h，随机延迟' + formatSeconds(delay) + '后续签');
-        await sendTG('🎯', '窗口内续期', '剩余' + h.toFixed(1) + 'h，' + formatSeconds(delay) + '后执行');
-        await new Promise(function(r) { setTimeout(r, delay * 1000); });
-        await tryRenew(page, totalMins);
       } else {
-        // 紧急模式：剩余 ≤ 3h，立即续签（延长紧急模式范围）
-        console.log('🚨 紧急模式: 剩余' + h.toFixed(1) + 'h，立即执行');
+        // 窗口内：不再随机等待，立即续签，把等待时间交给 15 分钟一次的 cron 兜底。
+        console.log('🎯 窗口内立即续期: 剩余' + h.toFixed(1) + 'h');
+        await sendTG('🎯', '窗口内续期', '剩余' + h.toFixed(1) + 'h，立即执行');
         await tryRenew(page, totalMins);
       }
     }
@@ -272,6 +256,7 @@ async function tryRenew(page, beforeMins) {
     console.log('❌ 流程失败: ' + error.message);
     await page.screenshot({ path: 'failure.png' });
     await sendTG('❌', '续签失败', error.message, 'failure.png');
+    process.exitCode = 1;
   } finally {
     await context.close();
     await browser.close();

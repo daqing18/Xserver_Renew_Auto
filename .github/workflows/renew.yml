@@ -3,10 +3,8 @@ name: XServer Extend (Node.js Matrix)
 on:
   schedule:
     # 原为 '0 */2 * * *'（UTC 每2小时整点）。
-    # 建议加密：自等待模式下脚本秒退成本极低，加密能显著缩短"预约-退出"兜底路径的拾起间隔。
-    #   - 公共仓库（Actions 免费不限分钟）: 用 */30 * * * *（每30分钟）
-    #   - 私有仓库免费账号（2000分钟/月配额有限）: 用 15 * * * *（每小时）即可
-    - cron: '*/30 * * * *'
+    # 15 分钟兜底：到达预约时间后真实检查；低于 4 小时立即续签。
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -51,9 +49,8 @@ jobs:
   renew:
     needs: setup
     runs-on: ubuntu-latest
-    # 自等待模式会让单 job 运行数小时，必须显式设置超时上限。
-    # 公共仓库最大 360（6小时）；私有仓库可设更大（如 720）。
-    timeout-minutes: 60
+    # 脚本不再在 Actions 内长睡；10 分钟足够完成安装、登录和续签。
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       max-parallel: 1
