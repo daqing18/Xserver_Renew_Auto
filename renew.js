@@ -291,8 +291,7 @@ async function tryRenew(page, beforeMins) {
     await page.getByRole('link', { name: 'ゲーム管理' }).click();
     await page.waitForLoadState('load');
     await page.screenshot({ path: '3_game_manage.png' });
-    var totalMins = await parseRemainingMinutes(page);
-    
+    var totalMins = await parseRemainingMinutes(page);    
     // 每次检查都顺带看一眼电源状态，关机就开机
     await ensurePoweredOn(page);
     console.log('🚀 点击延期');
