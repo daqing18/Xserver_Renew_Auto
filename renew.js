@@ -139,6 +139,70 @@ function updateNextCheckTime(hoursLater, reason) {
   gitCommitPush('[Bot] ' + ACC + ' 下次检查 ' + nextStr);
 }
 
+// ===== 电源状态检查：关机则自动开机 =====
+// 在游戏面板检查电源状态文字（运行中=「ゲーム起動中」/已停止=「ゲーム停止中」）；
+// 若「ゲームの操作」菜单里的「起動」可点，说明服务器处于关机状态，则点击开机
+// （开机确认框按用户反馈通常不出现，代码里保留兜底），并验证结果。
+async function ensurePoweredOn(page) {
+  try {
+    console.log('🔌 检查服务器电源状态...');
+    await page.goto('https://secure.xserver.ne.jp/xmgame/game/index', { waitUntil: 'load', timeout: 30000 });
+    await page.waitForTimeout(2000);
+
+    var running = await page.getByText('ゲーム起動中', { exact: false }).count() > 0;
+    var stopped = await page.getByText('ゲーム停止中', { exact: false }).count() > 0;
+    if (running && !stopped) {
+      console.log('✅ 服务器运行中，无需开机');
+      return true;
+    }
+    console.log(stopped ? '⚡ 检测到服务器已停止（ゲーム停止中），尝试开机...' : '⚠️ 未识别到运行状态，检查开机按钮...');
+
+    await page.getByRole('button', { name: 'ゲームの操作', exact: true }).click();
+    await page.waitForTimeout(1000);
+
+    var bootLink = page.getByRole('link', { name: '起動', exact: true });
+    if (await bootLink.count() === 0) {
+      console.log('ℹ️ 未找到「起動」按钮，视为已在运行');
+      return true;
+    }
+    var cls = (await bootLink.first.getAttribute('class').catch(() => '')) || '';
+    var ariaDis = (await bootLink.first.getAttribute('aria-disabled').catch(() => '')) || '';
+    var enabled = await bootLink.first.isEnabled().catch(() => false);
+    if (!enabled || /disabled/i.test(cls) || ariaDis === 'true') {
+      console.log('ℹ️ 「起動」不可点，视为已在运行');
+      return true;
+    }
+
+    await bootLink.first.click();
+    await page.waitForTimeout(2000);
+    // 开机确认框兜底（用户反馈通常不出现）
+    var confirmBtn = page.getByRole('button', { name: /OK|はい|確認|実行|起動する/ });
+    if (await confirmBtn.count() > 0) {
+      await confirmBtn.first.click({ timeout: 5000 }).catch(() => {});
+      console.log('🖱️ 已点击开机确认');
+      await page.waitForTimeout(3000);
+    } else {
+      console.log('ℹ️ 开机未弹出确认框');
+    }
+    await page.waitForTimeout(8000);
+    await page.goto('https://secure.xserver.ne.jp/xmgame/game/index', { waitUntil: 'load', timeout: 30000 });
+    await page.waitForTimeout(2000);
+    await page.screenshot({ path: 'power.png' });
+    var okRunning = await page.getByText('ゲーム起動中', { exact: false }).count() > 0;
+    if (okRunning) {
+      console.log('✅ 开机成功，服务器运行中');
+      await sendTG('⚡', '检测到关机并已开机', '服务器处于关机状态，已执行开机操作', 'power.png');
+      return true;
+    }
+    console.log('❌ 开机后仍未检测到运行状态，请人工检查');
+    await sendTG('❌', '开机失败', '已尝试开机但未检测到运行状态，请人工检查面板', 'power.png');
+    return false;
+  } catch (e) {
+    console.log('⚠️ 电源状态检查失败:', e.message);
+    return false;
+  }
+}
+
 async function tryRenew(page, beforeMins) {
   try {
     console.log('🔄 滚动到页面底部...');
@@ -157,6 +221,7 @@ async function tryRenew(page, beforeMins) {
     await page.getByRole('link', { name: '戻る' }).click();
     await page.waitForLoadState('load');
     await page.screenshot({ path: 'success.png' });
+    await ensurePoweredOn(page);
 
     var afterMins = await parseRemainingMinutes(page);
     var beforeH = beforeMins ? (beforeMins / 60).toFixed(1) : '?';
@@ -227,6 +292,9 @@ async function tryRenew(page, beforeMins) {
     await page.waitForLoadState('load');
     await page.screenshot({ path: '3_game_manage.png' });
     var totalMins = await parseRemainingMinutes(page);
+    
+    // 每次检查都顺带看一眼电源状态，关机就开机
+    await ensurePoweredOn(page);
     console.log('🚀 点击延期');
     await page.getByRole('link', { name: 'アップグレード・期限延長' }).click();
     await page.screenshot({ path: '4_renew_page.png' });
